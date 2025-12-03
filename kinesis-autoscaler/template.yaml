@@ -1,0 +1,310 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Kinesis Autoscaling Solution with DynamoDB and S3
+
+Parameters:
+  ConfigBucketName:
+    Type: String
+    Default: kinesis-autoscaler-config
+    Description: S3 bucket name for storing Kinesis configuration
+  
+  TrafficThreshold:
+    Type: Number
+    Default: 0.1
+    MinValue: 0.05
+    MaxValue: 0.5
+    Description: Traffic increase threshold for scaling (0.1 = 10%)
+  
+  SenderEmail:
+    Type: String
+    Description: SES verified sender email address
+    Default: alerts@example.com
+  
+  RecipientEmails:
+    Type: String
+    Description: Comma-separated list of recipient email addresses
+    Default: admin@example.com,devops@example.com
+  
+  MaxWorkers:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 10
+    Description: Maximum number of concurrent threads for processing streams
+
+Globals:
+  Function:
+    Timeout: 900
+    MemorySize: 512
+    Runtime: python3.9
+    Tracing: Active
+
+Resources:
+  # S3 Bucket for Configuration
+  ConfigBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref ConfigBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+      Tags:
+        - Key: Application
+          Value: KinesisAutoscaler
+        - Key: ManagedBy
+          Value: SAM
+
+  # DynamoDB Table for Scaling Tracking
+  ScalingTrackerTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: kinesis-scaling-tracker
+      AttributeDefinitions:
+        - AttributeName: stream_name
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+      KeySchema:
+        - AttributeName: stream_name
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Application
+          Value: KinesisAutoscaler
+        - Key: ManagedBy
+          Value: SAM
+
+  # IAM Role for Lambda Function
+  KinesisAutoscalerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: KinesisAutoscalerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: KinesisPermissions
+                Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:DescribeStreamSummary
+                  - kinesis:UpdateShardCount
+                  - kinesis:ListStreams
+                Resource: !Sub 'arn:aws:kinesis:${AWS::Region}:${AWS::AccountId}:stream/*'
+              
+              - Sid: CloudWatchMetrics
+                Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+              
+              - Sid: S3ConfigRead
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ConfigBucket.Arn
+                  - !Sub '${ConfigBucket.Arn}/*'
+              
+              - Sid: DynamoDBTracking
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:GetItem
+                Resource: !GetAtt ScalingTrackerTable.Arn
+              
+              - Sid: SESEmailAlerts
+                Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                Resource: '*'
+
+  # Lambda Function
+  KinesisAutoscalerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: kinesis-autoscaler
+      CodeUri: ./src
+      Handler: kinesis_autoscaler.lambda_handler
+      Description: Kinesis stream autoscaling with intelligent monitoring
+      Environment:
+        Variables:
+          S3_CONFIG_BUCKET: !Ref ConfigBucket
+          S3_CONFIG_KEY: kinesis_config.json
+          TRAFFIC_THRESHOLD: !Ref TrafficThreshold
+          SES_SENDER_EMAIL: !Ref SenderEmail
+          SES_RECIPIENT_EMAILS: !Ref RecipientEmails
+          DYNAMODB_TABLE: !Ref ScalingTrackerTable
+          MAX_WORKERS: !Ref MaxWorkers
+      Role: !GetAtt KinesisAutoscalerRole.Arn
+      Tags:
+        Application: KinesisAutoscaler
+        ManagedBy: SAM
+
+  # CloudWatch Log Group with Retention
+  KinesisAutoscalerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${KinesisAutoscalerFunction}'
+      RetentionInDays: 14
+
+  # CloudWatch Alarm for Lambda Errors
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: kinesis-autoscaler-errors
+      AlarmDescription: Alert on Lambda execution errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref KinesisAutoscalerFunction
+      TreatMissingData: notBreaching
+
+  # CloudWatch Alarm for Lambda Duration
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: kinesis-autoscaler-duration
+      AlarmDescription: Alert if Lambda runs close to timeout
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 700000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref KinesisAutoscalerFunction
+      TreatMissingData: notBreaching
+
+  # CloudWatch Dashboard
+  AutoscalerDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: KinesisAutoscaler
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", {"stat": "Sum", "label": "Invocations"}],
+                  [".", "Errors", {"stat": "Sum", "label": "Errors"}],
+                  [".", "Duration", {"stat": "Average", "label": "Avg Duration"}]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Lambda Metrics",
+                "period": 300,
+                "dimensions": {
+                  "FunctionName": ["${KinesisAutoscalerFunction}"]
+                }
+              }
+            },
+            {
+              "type": "log",
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${KinesisAutoscalerFunction}'\n| fields @timestamp, @message\n| filter @message like /ERROR/\n| sort @timestamp desc\n| limit 20",
+                "region": "${AWS::Region}",
+                "title": "Recent Errors",
+                "stacked": false
+              }
+            }
+          ]
+        }
+
+Outputs:
+  ConfigBucketName:
+    Description: S3 bucket name for configuration files
+    Value: !Ref ConfigBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ConfigBucket'
+
+  ConfigBucketArn:
+    Description: S3 bucket ARN
+    Value: !GetAtt ConfigBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ConfigBucketArn'
+
+  DynamoDBTableName:
+    Description: DynamoDB table name for scaling tracking
+    Value: !Ref ScalingTrackerTable
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBTable'
+
+  DynamoDBTableArn:
+    Description: DynamoDB table ARN
+    Value: !GetAtt ScalingTrackerTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBTableArn'
+
+  LambdaFunctionName:
+    Description: Lambda function name
+    Value: !Ref KinesisAutoscalerFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunction'
+
+  LambdaFunctionArn:
+    Description: Lambda function ARN
+    Value: !GetAtt KinesisAutoscalerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  DashboardURL:
+    Description: CloudWatch Dashboard URL
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=KinesisAutoscaler'
+
+  DeploymentCommand:
+    Description: Command to deploy this stack
+    Value: !Sub |
+      sam build && sam deploy --stack-name ${AWS::StackName} --capabilities CAPABILITY_IAM --parameter-overrides ConfigBucketName=${ConfigBucketName} TrafficThreshold=${TrafficThreshold} SenderEmail=${SenderEmail} RecipientEmails=${RecipientEmails} MaxWorkers=${MaxWorkers}
+
+  UpdateParametersCommand:
+    Description: Command to update Lambda environment variables
+    Value: !Sub |
+      aws lambda update-function-configuration --function-name ${KinesisAutoscalerFunction} --environment Variables="{S3_CONFIG_BUCKET=${ConfigBucket},S3_CONFIG_KEY=kinesis_config.json,TRAFFIC_THRESHOLD=0.1,SES_SENDER_EMAIL=your-email@example.com,SES_RECIPIENT_EMAILS=admin@example.com,DYNAMODB_TABLE=${ScalingTrackerTable},MAX_WORKERS=5}"
